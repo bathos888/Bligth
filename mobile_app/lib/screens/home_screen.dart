@@ -354,116 +354,132 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _refreshData,
-        color: AppTheme.accentWarm,
-        backgroundColor: AppTheme.cardDark,
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Indicateur LDR
-              LDRIndicator(
-                state: _state.ldrState,
-                value: _state.ldrValue,
-                modeAuto: isAnyAuto,
-              ),
-              const SizedBox(height: 24),
+      body: Column(
+        children: [
+          // Haut scrollable : LDR + Contrôle Global
+          Expanded(
+            child: RefreshIndicator(
+              onRefresh: _refreshData,
+              color: AppTheme.accentWarm,
+              backgroundColor: AppTheme.cardDark,
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Indicateur LDR
+                    LDRIndicator(
+                      state: _state.ldrState,
+                      value: _state.ldrValue,
+                      modeAuto: isAnyAuto,
+                    ),
+                    const SizedBox(height: 24),
 
-              // Contrôle Global Mode
-              Wrap(
-                spacing: 8.0,
-                runSpacing: 8.0,
-                alignment: WrapAlignment.spaceBetween,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  const Text(
-                    'Contrôle Global',
-                    style: TextStyle(
-                      color: AppTheme.textPrimary,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
+                    // Contrôle Global Mode
+                    Wrap(
+                      spacing: 8.0,
+                      runSpacing: 8.0,
+                      alignment: WrapAlignment.spaceBetween,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        const Text(
+                          'Contrôle Global',
+                          style: TextStyle(
+                            color: AppTheme.textPrimary,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            TextButton.icon(
+                              icon: const Icon(Icons.auto_awesome, size: 18),
+                              label: const Text('Tout Auto'),
+                              onPressed:
+                                  isOffline ? null : () => _setAllModes(true),
+                              style: TextButton.styleFrom(
+                                  foregroundColor: AppTheme.accentCool),
+                            ),
+                            const SizedBox(width: 8),
+                            TextButton.icon(
+                              icon: const Icon(Icons.back_hand, size: 18),
+                              label: const Text('Tout Manuel'),
+                              onPressed:
+                                  isOffline ? null : () => _setAllModes(false),
+                              style: TextButton.styleFrom(
+                                  foregroundColor: AppTheme.accentWarm),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // Bas fixe : Relais
+          Container(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Lumières',
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Grille 4 relais (2 colonnes)
+                GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    childAspectRatio: 1.1,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 12,
+                  ),
+                  itemCount: 4,
+                  itemBuilder: (context, index) {
+                    return RelayCard(
+                      index: index,
+                      isOn: _state.relayStates.length > index
+                          ? _state.relayStates[index]
+                          : false,
+                      label: _relayLabels[index],
+                      onToggle: () => _toggleRelay(index),
+                      onLongPress: () => _showRelayMenu(index),
+                      isOffline: isOffline,
+                      isAutoMode: _state.relayAutoModes.length > index
+                          ? _state.relayAutoModes[index]
+                          : false,
+                    );
+                  },
+                ),
+
+                // Info debug
+                const SizedBox(height: 8),
+                Center(
+                  child: Text(
+                    'ESP IP: $_espIp${_state.ip.isNotEmpty ? " (detecté: ${_state.ip})" : ""}',
+                    style: const TextStyle(
+                      color: AppTheme.textSecondary,
+                      fontSize: 12,
                     ),
                   ),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      TextButton.icon(
-                        icon: const Icon(Icons.auto_awesome, size: 18),
-                        label: const Text('Tout Auto'),
-                        onPressed: isOffline ? null : () => _setAllModes(true),
-                        style: TextButton.styleFrom(
-                            foregroundColor: AppTheme.accentCool),
-                      ),
-                      const SizedBox(width: 8),
-                      TextButton.icon(
-                        icon: const Icon(Icons.back_hand, size: 18),
-                        label: const Text('Tout Manuel'),
-                        onPressed: isOffline ? null : () => _setAllModes(false),
-                        style: TextButton.styleFrom(
-                            foregroundColor: AppTheme.accentWarm),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-
-              // Titre section
-              const Text(
-                'Lumières',
-                style: TextStyle(
-                  color: AppTheme.textPrimary,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
                 ),
-              ),
-              const SizedBox(height: 16),
-
-              // Grille 5 relais (2 colonnes)
-              GridView.builder(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  childAspectRatio: 1.1,
-                  crossAxisSpacing: 12,
-                  mainAxisSpacing: 12,
-                ),
-                itemCount: 4,
-                itemBuilder: (context, index) {
-                  return RelayCard(
-                    index: index,
-                    isOn: _state.relayStates.length > index
-                        ? _state.relayStates[index]
-                        : false,
-                    label: _relayLabels[index],
-                    onToggle: () => _toggleRelay(index),
-                    onLongPress: () => _showRelayMenu(index),
-                    isOffline: isOffline,
-                    isAutoMode: _state.relayAutoModes.length > index
-                        ? _state.relayAutoModes[index]
-                        : false,
-                  );
-                },
-              ),
-
-              // Info debug
-              const SizedBox(height: 32),
-              Center(
-                child: Text(
-                  'ESP IP: $_espIp${_state.ip.isNotEmpty ? " (detecté: ${_state.ip})" : ""}',
-                  style: const TextStyle(
-                    color: AppTheme.textSecondary,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
+        ],
       ),
     );
   }
