@@ -187,22 +187,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
               padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
-                  Text('Nuit: $_nuit%',
+                  Text('Nuit: $_nuit (0-1023)',
                       style: const TextStyle(color: AppTheme.textSecondary)),
                   Slider(
-                    value: _nuit.toDouble(),
+                    value: _nuit.toDouble().clamp(0, 1023),
                     min: 0,
-                    max: 50,
-                    divisions: 50,
+                    max: 1023,
+                    divisions: 100,
                     onChanged: (v) => setState(() => _nuit = v.round()),
                   ),
-                  Text('Jour: $_jour%',
+                  Text('Jour: $_jour (0-1023)',
                       style: const TextStyle(color: AppTheme.textSecondary)),
                   Slider(
-                    value: _jour.toDouble(),
-                    min: 51,
-                    max: 100,
-                    divisions: 50,
+                    value: _jour.toDouble().clamp(0, 1023),
+                    min: 0,
+                    max: 1023,
+                    divisions: 100,
                     onChanged: (v) => setState(() => _jour = v.round()),
                   ),
                   ElevatedButton(

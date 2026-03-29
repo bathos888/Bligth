@@ -12,9 +12,9 @@ class DeviceState extends Equatable {
 
   const DeviceState({
     this.ldrState = 'JOUR',
-    this.ldrValue = 50,
-    this.seuilNuit = 30,
-    this.seuilJour = 70,
+    this.ldrValue = 500,
+    this.seuilNuit = 300,
+    this.seuilJour = 700,
     this.wifiConnected = false,
     this.ip = '',
     this.relayStates = const [false, false, false, false],

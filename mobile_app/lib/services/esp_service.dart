@@ -90,8 +90,8 @@ class EspService {
         return DeviceState(
           ldrState: data['etat_ldr'] ?? 'JOUR',
           ldrValue: data['valeur_ldr'] ?? 0,
-          seuilNuit: data['seuil_nuit'] ?? 30,
-          seuilJour: data['seuil_jour'] ?? 70,
+          seuilNuit: data['seuil_nuit'] ?? 300,
+          seuilJour: data['seuil_jour'] ?? 700,
           wifiConnected: data['wifi_connected'] ?? false,
           ip: data['ip'] ?? '',
           relayStates: _padToFour(List<bool>.from(data['relays'] ?? [])),

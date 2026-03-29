@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import '../widgets/app_theme.dart';
 
 class LDRIndicator extends StatelessWidget {
-  final String state;      // JOUR, NUIT, DEBUT_NUIT, DEBUT_JOUR
-  final int value;         // 0-100
+  final String state; // JOUR, NUIT, DEBUT_NUIT, DEBUT_JOUR
+  final int value; // 0-1023 (raw LDR)
   final bool modeAuto;
 
   const LDRIndicator({
@@ -34,7 +34,7 @@ class LDRIndicator extends StatelessWidget {
         return Colors.indigo;
       case 'DEBUT_NUIT':
       case 'DEBUT_JOUR':
-        return Colors.purple;  // Transition
+        return Colors.purple; // Transition
       default:
         return AppTheme.textSecondary;
     }
@@ -91,7 +91,7 @@ class LDRIndicator extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Luminosité: $value% • Mode: ${modeAuto ? 'Auto' : 'Manuel'}',
+                  'Luminosité: $value / 1023 • Mode: ${modeAuto ? 'Auto' : 'Manuel'}',
                   style: const TextStyle(
                     color: AppTheme.textSecondary,
                     fontSize: 14,
@@ -108,7 +108,7 @@ class LDRIndicator extends StatelessWidget {
                 width: 50,
                 height: 50,
                 child: CircularProgressIndicator(
-                  value: value / 100,
+                  value: (value / 1023).clamp(0.0, 1.0),
                   backgroundColor: AppTheme.inactive,
                   valueColor: AlwaysStoppedAnimation<Color>(_color),
                   strokeWidth: 4,
