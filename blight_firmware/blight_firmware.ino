@@ -48,7 +48,7 @@ unsigned long lastLdrSample = 0;
 
 // --- Relay State ---
 bool relayStates[NUM_RELAYS] = {false};
-bool relayAutoModes[NUM_RELAYS] = {true, true, true, true, true, true};
+bool relayAutoModes[NUM_RELAYS] = {true, true, true, true};
 
 // --- Thresholds ---
 int seuilNuit = DEFAULT_SEUIL_NUIT;

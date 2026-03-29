@@ -6,8 +6,8 @@
 #define STA_SSID     ""
 #define STA_PASSWORD ""
 
-#define NUM_RELAYS 6
-const uint8_t RELAY_PINS[NUM_RELAYS] = {5, 4, 14, 12, 13, 16};
+#define NUM_RELAYS 4
+const uint8_t RELAY_PINS[NUM_RELAYS] = {5, 4, 14, 12};
 
 #define LDR_PIN A0
 
