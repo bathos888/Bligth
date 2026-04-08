@@ -1,9 +1,9 @@
 /**
- * BLight V1.0.7 - Main Firmware
+ * BLight V1.0.8 - Main Firmware
  * Target: Wemos D1 Mini (ESP8266)
  *
  * Features:
- * - 6 relays with per-relay auto/manual mode
+ * - 4 relays with per-relay auto/manual mode
  * - Captive portal for WiFi configuration (WiFiManager)
  * - HTTP REST API for mobile app
  * - FSM LDR with safety delay
@@ -11,6 +11,7 @@
  * - LittleFS persistence (relays, modes, seuils)
  * - /api/relay/set : forçage d'état explicite (idempotent)
  * - mDNS restart automatique après reconnexion WiFi
+ * - Fallback portail AP si réseau absent trop longtemps
  *
  * Dependencies: ArduinoJson v6, WiFiManager
  * Board package: esp8266 >= 3.0.0  (LittleFS inclus)
@@ -58,9 +59,15 @@ int seuilJour = DEFAULT_SEUIL_JOUR;
 bool wifiConnected = false;
 unsigned long lastWifiCheck = 0;
 
+// Nombre de tentatives de reconnexion échouées consécutives.
+// Au-delà de WIFI_MAX_RETRIES, l'ESP bascule en portail AP.
+// 10 tentatives × 30 s = 5 minutes avant fallback.
+#define WIFI_MAX_RETRIES 10
+uint8_t wifiRetryCount = 0;
+
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- BLight V1.0.7 ---");
+  Serial.println("\n--- BLight V1.0.8 ---");
 
   // Init relays OFF (Active LOW)
   for (int i = 0; i < NUM_RELAYS; i++) {
@@ -101,10 +108,42 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) {
       if (wifiConnected) Serial.println("WiFi Disconnected");
       wifiConnected = false;
-      WiFi.reconnect();
+      wifiRetryCount++;
+      Serial.println("WiFi: retry " + String(wifiRetryCount) + "/" + String(WIFI_MAX_RETRIES));
+
+      if (wifiRetryCount >= WIFI_MAX_RETRIES) {
+        // Le réseau est absent depuis trop longtemps → portail AP
+        Serial.println("WiFi: max retries reached — starting fallback AP portal");
+        wifiRetryCount = 0;
+        WiFiManager wm;
+        wm.setConfigPortalTimeout(180);
+        wm.setAPStaticIPConfig(
+          IPAddress(192, 168, 4, 1),
+          IPAddress(192, 168, 4, 1),
+          IPAddress(255, 255, 255, 0)
+        );
+        // startConfigPortal est non-bloquant pendant 180 s max,
+        // puis rend la main que l'utilisateur ait configuré ou non.
+        bool ok = wm.startConfigPortal(AP_SSID, AP_PASSWORD);
+        if (ok) {
+          wifiConnected = true;
+          Serial.println("WiFi: configured via fallback portal. IP = " + WiFi.localIP().toString());
+          MDNS.end();
+          if (MDNS.begin("blight")) {
+            MDNS.addService("http", "tcp", 80);
+            Serial.println("mDNS restarted: blight.local");
+          }
+        } else {
+          Serial.println("WiFi: fallback portal timed out. Still offline.");
+          // On repart à zéro — nouvelle fenêtre de 5 min avant prochain essai
+        }
+      } else {
+        WiFi.reconnect();
+      }
     } else {
       if (!wifiConnected) {
         wifiConnected = true;
+        wifiRetryCount = 0;   // connexion rétablie — reset compteur
         // Redémarre mDNS — il ne survit pas à une coupure WiFi
         MDNS.end();
         if (MDNS.begin("blight")) {
@@ -216,8 +255,8 @@ String readBody() {
 
 // --- GET /api/status ---
 void handleStatus() {
-  StaticJsonDocument<768> doc;
-  doc["app"] = "BLight V1.0.7";
+  StaticJsonDocument<512> doc;
+  doc["app"] = "BLight V1.0.8";
   doc["etat_ldr"] = getLDRStateString(currentState);
   doc["valeur_ldr"] = lastLdrValue;
   doc["seuil_nuit"] = seuilNuit;

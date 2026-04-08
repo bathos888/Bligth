@@ -26,6 +26,17 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+
+	<!-- ✅ Obligatoire iOS 14+ pour accès réseau local -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>BLight a besoin d'accéder au réseau local pour trouver votre appareil BLight automatiquement.</string>
+
+	<!-- ✅ Déclare le service Bonjour utilisé par l'ESP -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+	</array>
+
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
