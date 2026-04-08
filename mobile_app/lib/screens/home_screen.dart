@@ -26,7 +26,6 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isConnected = false;
   bool _isSearching = true;
 
-  // Labels modifiables pour les 4 relais
   final List<String> _relayLabels = [
     'Salon',
     'Cuisine',
@@ -44,70 +43,66 @@ class _HomeScreenState extends State<HomeScreen> {
     _prefs = await SharedPreferences.getInstance();
     final savedIp = _prefs?.getString('esp_ip');
 
-    // Charger les noms personnalisés
     for (int i = 0; i < 4; i++) {
       final name = _prefs?.getString('relay_name_$i');
-      if (name != null) {
-        _relayLabels[i] = name;
-      }
+      if (name != null) _relayLabels[i] = name;
     }
 
-    if (savedIp != null && savedIp.isNotEmpty) {
+    setState(() => _isSearching = true);
+
+    final found = await _espService.discoverEsp(savedIp: savedIp);
+
+    if (found != null) {
+      if (found != 'firebase') {
+        await _prefs?.setString('esp_ip', found);
+        setState(() => _espIp = found);
+      }
       setState(() {
-        _espIp = savedIp;
-        _espService.setIp(savedIp);
-        _isSearching = true;
+        _isConnected = true;
+        _isSearching = false;
       });
-
-      final connected = await _espService.heartbeat();
-      if (connected) {
-        setState(() {
-          _isConnected = true;
-          _isSearching = false;
-        });
-        _startAutoRefresh();
-      } else {
-        setState(() {
-          _isConnected = false;
-          _isSearching = false;
-        });
-      }
+      _startAutoRefresh();
+    } else {
+      setState(() {
+        _isConnected = false;
+        _isSearching = false;
+      });
     }
+
     _startHeartbeat();
   }
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+    _heartbeatTimer =
+        Timer.periodic(const Duration(seconds: 10), (_) async {
       final connected = await _espService.heartbeat();
-      if (mounted) {
-        setState(() {
-          _isConnected = connected;
-        });
-      }
+      if (mounted) setState(() => _isConnected = connected);
     });
   }
 
-  void _showPinDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: AppTheme.surfaceDark,
-        title:
-            const Text('BLight', style: TextStyle(color: AppTheme.textPrimary)),
-        content: const Text(
-          'Version avec 4 relais uniquement.',
-          style: TextStyle(color: AppTheme.textSecondary),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child:
-                const Text('OK', style: TextStyle(color: AppTheme.accentCool)),
-          ),
-        ],
-      ),
-    );
+  void _startAutoRefresh() {
+    _refreshData();
+    _refreshTimer?.cancel();
+    final interval = _espService.isFirebase
+        ? const Duration(seconds: 4)
+        : const Duration(seconds: 2);
+    _refreshTimer = Timer.periodic(interval, (_) => _refreshData());
+  }
+
+  Future<void> _refreshData() async {
+    if (_debounceTimer?.isActive == true) return;
+    final newState = await _espService.fetchStatus();
+    if (mounted) {
+      setState(() {
+        if (newState != null) {
+          _state = newState;
+          _isConnected = true;
+        } else {
+          _state = _state.copyWith(wifiConnected: false);
+        }
+      });
+    }
   }
 
   @override
@@ -118,65 +113,38 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  void _startAutoRefresh() {
-    _refreshData();
-    _refreshTimer?.cancel(); // Sécurité
-    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      _refreshData();
-    });
-  }
-
-  Future<void> _refreshData() async {
-    if (_debounceTimer?.isActive == true) return;
-
-    final newState = await _espService.fetchStatus();
-    if (mounted) {
-      setState(() {
-        if (newState != null) {
-          _state = newState;
-        } else {
-          _state = _state.copyWith(wifiConnected: false);
-        }
-      });
-    }
-  }
-
   Future<void> _toggleRelay(int index) async {
-    // Optimistic UI Update - toggle immediately
-    final previousState =
-        _state.relayStates.length > index ? _state.relayStates[index] : false;
+    final previousState = _state.relayStates.length > index
+        ? _state.relayStates[index]
+        : false;
     final newStates = List<bool>.from(_state.relayStates);
     newStates[index] = !previousState;
     final newAutoModes = List<bool>.from(_state.relayAutoModes);
     newAutoModes[index] = false;
 
     setState(() {
-      _state =
-          _state.copyWith(relayStates: newStates, relayAutoModes: newAutoModes);
+      _state = _state.copyWith(
+          relayStates: newStates, relayAutoModes: newAutoModes);
     });
 
-    // Pause polling for 3 seconds (debounce)
     _debounceTimer?.cancel();
     _debounceTimer = Timer(const Duration(seconds: 3), () {});
 
-    // Send to ESP
-    final success = await _espService.toggleRelay(index);
-    if (!success) {
-      // Rollback on failure
-      if (mounted) {
-        setState(() {
-          final rollbackStates = List<bool>.from(_state.relayStates);
-          rollbackStates[index] = previousState;
-          newAutoModes[index] = true;
-          _state = _state.copyWith(
-              relayStates: rollbackStates, relayAutoModes: newAutoModes);
-        });
-      }
+    final success = await _espService.toggleRelayWithState(index, previousState);
+    if (!success && mounted) {
+      setState(() {
+        final rollback = List<bool>.from(_state.relayStates);
+        rollback[index] = previousState;
+        newAutoModes[index] = true;
+        _state = _state.copyWith(
+            relayStates: rollback, relayAutoModes: newAutoModes);
+      });
     }
   }
 
   Future<void> _showRelayMenu(int index) async {
-    final nameController = TextEditingController(text: _relayLabels[index]);
+    final nameController =
+        TextEditingController(text: _relayLabels[index]);
 
     await showModalBottomSheet(
       context: context,
@@ -200,7 +168,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     fontSize: 18,
                     fontWeight: FontWeight.bold)),
             const SizedBox(height: 16),
-            // Renommer
             TextField(
               controller: nameController,
               style: const TextStyle(color: AppTheme.textPrimary),
@@ -214,9 +181,9 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 20),
-            // Modes
             const Text('Mode de fonctionnement',
-                style: TextStyle(color: AppTheme.textSecondary, fontSize: 14)),
+                style: TextStyle(
+                    color: AppTheme.textSecondary, fontSize: 14)),
             const SizedBox(height: 8),
             Wrap(
               spacing: 10,
@@ -224,7 +191,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ChoiceChip(
                   label: const Text('Manuel'),
                   selected: !_state.relayAutoModes[index],
-                  onSelected: (val) {
+                  onSelected: (_) {
                     _setRelayMode(index, false);
                     Navigator.pop(context);
                   },
@@ -232,7 +199,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ChoiceChip(
                   label: const Text('Auto (LDR)'),
                   selected: _state.relayAutoModes[index],
-                  onSelected: (val) {
+                  onSelected: (_) {
                     _setRelayMode(index, true);
                     Navigator.pop(context);
                   },
@@ -246,12 +213,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 style: ElevatedButton.styleFrom(
                     backgroundColor: AppTheme.accentWarm),
                 onPressed: () async {
-                  setState(() => _relayLabels[index] = nameController.text);
+                  setState(
+                      () => _relayLabels[index] = nameController.text);
                   await _prefs?.setString(
                       'relay_name_$index', nameController.text);
                   if (context.mounted) Navigator.pop(context);
                 },
-                child: const Text('Enregistrer les modifications',
+                child: const Text('Enregistrer',
                     style: TextStyle(color: Colors.black)),
               ),
             ),
@@ -263,8 +231,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _setRelayMode(int index, bool auto) async {
-    final success = await _espService.setRelayMode(index, auto);
-    if (success) _refreshData();
+    await _espService.setRelayMode(index, auto);
+    _refreshData();
   }
 
   Future<void> _setAllModes(bool auto) async {
@@ -274,10 +242,15 @@ class _HomeScreenState extends State<HomeScreen> {
     _refreshData();
   }
 
+  // ============================================================
+  // BUILD
+  // ============================================================
+
   @override
   Widget build(BuildContext context) {
     final isOffline = !_isConnected;
     final isAnyAuto = _state.relayAutoModes.contains(true);
+    final isFirebaseMode = _espService.isFirebase;
 
     return Scaffold(
       backgroundColor: AppTheme.backgroundDark,
@@ -288,55 +261,41 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.asset(
-                'assets/images/logo.jpg',
-                height: 32,
-                width: 32,
-                fit: BoxFit.cover,
-              ),
+              child: Image.asset('assets/images/logo.jpg',
+                  height: 32, width: 32, fit: BoxFit.cover),
             ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'BLight',
-                    style: TextStyle(
-                      color: AppTheme.textPrimary,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  if (_isSearching)
-                    const Text(
-                      'Recherche en cours...',
+                  const Text('BLight',
                       style: TextStyle(
-                        color: AppTheme.accentCool,
-                        fontSize: 10,
-                      ),
-                    ),
+                          color: AppTheme.textPrimary,
+                          fontWeight: FontWeight.bold)),
+                  if (_isSearching)
+                    const Text('Recherche en cours...',
+                        style: TextStyle(
+                            color: AppTheme.accentCool, fontSize: 10)),
                 ],
               ),
             ),
           ],
         ),
         actions: [
-          // Bouton cadenas pour accéder aux relais avancés
-          IconButton(
-            icon: Icon(
-              Icons.info_outline,
-              color: AppTheme.textSecondary,
+          // Badge mode connexion
+          if (!_isSearching)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: _buildConnectionBadge(isFirebaseMode, isOffline),
             ),
-            onPressed: _showPinDialog,
-            tooltip: 'Accès avancé',
-          ),
-          // Bouton Paramètres
+          // Paramètres
           IconButton(
             icon: const Icon(Icons.settings, color: AppTheme.textSecondary),
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(
-                builder: (context) => SettingsScreen(
+                builder: (_) => SettingsScreen(
                   currentState: _state,
                   espService: _espService,
                   onRefresh: _refreshData,
@@ -344,19 +303,14 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ),
-          // Indicateur connexion (Heartbeat)
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: Icon(
-              _isConnected ? Icons.wifi : Icons.wifi_off,
-              color: _isConnected ? Colors.blue : Colors.grey,
-            ),
-          ),
         ],
       ),
       body: Column(
         children: [
-          // Haut scrollable : LDR + Contrôle Global
+          // Banner Firebase mode
+          if (isFirebaseMode && _isConnected)
+            _buildFirebaseBanner(),
+
           Expanded(
             child: RefreshIndicator(
               onRefresh: _refreshData,
@@ -368,37 +322,33 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Indicateur LDR
                     LDRIndicator(
                       state: _state.ldrState,
                       value: _state.ldrValue,
                       modeAuto: isAnyAuto,
                     ),
                     const SizedBox(height: 24),
-
-                    // Contrôle Global Mode
                     Wrap(
                       spacing: 8.0,
                       runSpacing: 8.0,
                       alignment: WrapAlignment.spaceBetween,
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        const Text(
-                          'Contrôle Global',
-                          style: TextStyle(
-                            color: AppTheme.textPrimary,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
+                        const Text('Contrôle Global',
+                            style: TextStyle(
+                                color: AppTheme.textPrimary,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w600)),
                         Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             TextButton.icon(
-                              icon: const Icon(Icons.auto_awesome, size: 18),
+                              icon:
+                                  const Icon(Icons.auto_awesome, size: 18),
                               label: const Text('Tout Auto'),
-                              onPressed:
-                                  isOffline ? null : () => _setAllModes(true),
+                              onPressed: isOffline
+                                  ? null
+                                  : () => _setAllModes(true),
                               style: TextButton.styleFrom(
                                   foregroundColor: AppTheme.accentCool),
                             ),
@@ -406,8 +356,9 @@ class _HomeScreenState extends State<HomeScreen> {
                             TextButton.icon(
                               icon: const Icon(Icons.back_hand, size: 18),
                               label: const Text('Tout Manuel'),
-                              onPressed:
-                                  isOffline ? null : () => _setAllModes(false),
+                              onPressed: isOffline
+                                  ? null
+                                  : () => _setAllModes(false),
                               style: TextButton.styleFrom(
                                   foregroundColor: AppTheme.accentWarm),
                             ),
@@ -421,27 +372,23 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
 
-          // Bas fixe : Relais
+          // Grille relais (bas fixe)
           Container(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Lumières',
-                  style: TextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
+                const Text('Lumières',
+                    style: TextStyle(
+                        color: AppTheme.textPrimary,
+                        fontSize: 20,
+                        fontWeight: FontWeight.w600)),
                 const SizedBox(height: 12),
-
-                // Grille 4 relais (2 colonnes)
                 GridView.builder(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  gridDelegate:
+                      const SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: 2,
                     childAspectRatio: 1.1,
                     crossAxisSpacing: 12,
@@ -464,19 +411,97 @@ class _HomeScreenState extends State<HomeScreen> {
                     );
                   },
                 ),
-
-                // Info debug
                 const SizedBox(height: 8),
                 Center(
                   child: Text(
-                    'ESP IP: $_espIp${_state.ip.isNotEmpty ? " (detecté: ${_state.ip})" : ""}',
+                    isFirebaseMode
+                        ? '🌐 Contrôle via Internet (Firebase)'
+                        : 'ESP IP: $_espIp',
                     style: const TextStyle(
-                      color: AppTheme.textSecondary,
-                      fontSize: 12,
-                    ),
+                        color: AppTheme.textSecondary, fontSize: 12),
                   ),
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionBadge(bool isFirebase, bool isOffline) {
+    if (isOffline) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.red.withOpacity(0.2),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.red.withOpacity(0.5)),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.wifi_off, color: Colors.red, size: 14),
+            SizedBox(width: 4),
+            Text('Hors ligne',
+                style: TextStyle(color: Colors.red, fontSize: 11)),
+          ],
+        ),
+      );
+    }
+
+    if (isFirebase) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.orange.withOpacity(0.2),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.orange.withOpacity(0.5)),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.cloud, color: Colors.orange, size: 14),
+            SizedBox(width: 4),
+            Text('Internet',
+                style: TextStyle(color: Colors.orange, fontSize: 11)),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.green.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.green.withOpacity(0.5)),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.wifi, color: Colors.green, size: 14),
+          SizedBox(width: 4),
+          Text('Local',
+              style: TextStyle(color: Colors.green, fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFirebaseBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: Colors.orange.withOpacity(0.15),
+      child: const Row(
+        children: [
+          Icon(Icons.cloud_queue, color: Colors.orange, size: 16),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Mode Internet — commandes envoyées via Firebase, l\'ESP les applique automatiquement.',
+              style: TextStyle(color: Colors.orange, fontSize: 12),
             ),
           ),
         ],

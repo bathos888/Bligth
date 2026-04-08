@@ -11,18 +11,16 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.2
 
-  # Communication locale ESP
+  # Communication locale ESP + Firebase REST
   http: ^1.1.0
-  bonsoir: ^5.1.6          # ✅ mDNS discovery (Android + iOS)
+
+  # mDNS discovery
+  bonsoir: ^5.1.6
 
   # UI & State
   shared_preferences: ^2.2.2
   equatable: ^2.0.5
   flutter_bloc: ^8.1.3
-
-  # Cloud (prévu étape Firebase)
-  firebase_core: ^2.24.2
-  firebase_database: ^10.4.0
 
   # Thème
   google_fonts: ^6.1.0

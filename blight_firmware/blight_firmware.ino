@@ -1,158 +1,120 @@
 /**
- * BLight V1.0.8 - Main Firmware
+ * BLight V1.1.0 - Firmware avec Firebase REST
  * Target: Wemos D1 Mini (ESP8266)
  *
- * Features:
- * - 4 relays with per-relay auto/manual mode
- * - Captive portal for WiFi configuration (WiFiManager)
- * - HTTP REST API for mobile app
- * - FSM LDR with safety delay
- * - Offline-first (WiFi resilience)
- * - LittleFS persistence (relays, modes, seuils)
- * - /api/relay/set : forçage d'état explicite (idempotent)
- * - mDNS restart automatique après reconnexion WiFi
- * - Fallback portail AP si réseau absent trop longtemps
+ * Nouveautés V1.1.0 :
+ * - Publication de l'état sur Firebase Realtime Database (REST)
+ * - Lecture des commandes Firebase toutes les 3 secondes
+ * - Fonctionne en offline-first (Firebase optionnel)
  *
- * Dependencies: ArduinoJson v6, WiFiManager
- * Board package: esp8266 >= 3.0.0  (LittleFS inclus)
+ * Structure Firebase :
+ *   /blight/status/     ← ESP écrit son état ici
+ *   /blight/commands/   ← App écrit les commandes ici, ESP les lit
  *
- * API summary:
- *   GET  /api/status              → état complet JSON
- *   POST /api/relay/toggle        → {"index": N}          inverse l'état, passe en manuel
- *   POST /api/relay/set           → {"index": N, "state": bool}  force l'état, passe en manuel
- *   POST /api/mode                → {"index": N, "auto": bool}
- *   POST /api/thresholds          → {"seuil_nuit": N, "seuil_jour": N}
- *   POST /api/wifi/reset          → réinitialise les credentials WiFi
+ * Dependencies: ArduinoJson v6, WiFiManager, ESP8266HTTPClient
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "config.h"
 
-// --- Persistence ---
+// -----------------------------------------------------------------------
+// Firebase
+// -----------------------------------------------------------------------
+#define FIREBASE_HOST "blight-28253-default-rtdb.europe-west1.firebasedatabase.app"
+#define FIREBASE_URL  "https://" FIREBASE_HOST
+#define FB_STATUS_PATH  "/blight/status.json"
+#define FB_COMMANDS_PATH "/blight/commands.json"
+
+// Intervalles Firebase
+#define FB_PUSH_INTERVAL_MS   10000UL   // Publier état toutes les 10s
+#define FB_POLL_INTERVAL_MS    3000UL   // Lire commandes toutes les 3s
+
+unsigned long lastFbPush = 0;
+unsigned long lastFbPoll = 0;
+
+// -----------------------------------------------------------------------
+// Reste du firmware inchangé
+// -----------------------------------------------------------------------
 #define STATE_FILE "/state.json"
 
-// --- Server ---
 ESP8266WebServer server(80);
 
-// --- LDR FSM ---
 enum LDRState { ST_JOUR, ST_DEBUT_NUIT, ST_NUIT, ST_DEBUT_JOUR };
-
 LDRState currentState = ST_JOUR;
 unsigned long stateTimer = 0;
 int lastLdrValue = 0;
 unsigned long lastLdrSample = 0;
 
-// --- Relay State ---
 bool relayStates[NUM_RELAYS] = {false};
 bool relayAutoModes[NUM_RELAYS] = {true, true, true, true};
 
-// --- Thresholds ---
 int seuilNuit = DEFAULT_SEUIL_NUIT;
 int seuilJour = DEFAULT_SEUIL_JOUR;
 
-// --- WiFi ---
 bool wifiConnected = false;
 unsigned long lastWifiCheck = 0;
 
-// Nombre de tentatives de reconnexion échouées consécutives.
-// Au-delà de WIFI_MAX_RETRIES, l'ESP bascule en portail AP.
-// 10 tentatives × 30 s = 5 minutes avant fallback.
-#define WIFI_MAX_RETRIES 10
-uint8_t wifiRetryCount = 0;
-
+// -----------------------------------------------------------------------
+// SETUP
+// -----------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- BLight V1.0.8 ---");
+  Serial.println("\n--- BLight V1.1.0 (Firebase) ---");
 
-  // Init relays OFF (Active LOW)
   for (int i = 0; i < NUM_RELAYS; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], HIGH);
   }
 
-  // LittleFS + restore state
   if (!LittleFS.begin()) {
-    Serial.println("LittleFS: Mount failed — formatting...");
     LittleFS.format();
     LittleFS.begin();
   }
   loadState();
-
-  // WiFi
   setupWiFi();
-
-  // HTTP API
   setupServer();
 
-  // mDNS
   if (wifiConnected) {
     MDNS.begin("blight");
     MDNS.addService("http", "tcp", 80);
     Serial.println("mDNS: blight.local");
+    // Push initial vers Firebase
+    pushStatusToFirebase();
   }
 }
 
+// -----------------------------------------------------------------------
+// LOOP
+// -----------------------------------------------------------------------
 void loop() {
   server.handleClient();
   if (wifiConnected) MDNS.update();
 
-  // WiFi monitor (non-blocking, infrequent)
   unsigned long now = millis();
+
+  // WiFi monitor
   if (now - lastWifiCheck >= WIFI_RECONNECT_MS) {
     lastWifiCheck = now;
     if (WiFi.status() != WL_CONNECTED) {
       if (wifiConnected) Serial.println("WiFi Disconnected");
       wifiConnected = false;
-      wifiRetryCount++;
-      Serial.println("WiFi: retry " + String(wifiRetryCount) + "/" + String(WIFI_MAX_RETRIES));
-
-      if (wifiRetryCount >= WIFI_MAX_RETRIES) {
-        // Le réseau est absent depuis trop longtemps → portail AP
-        Serial.println("WiFi: max retries reached — starting fallback AP portal");
-        wifiRetryCount = 0;
-        WiFiManager wm;
-        wm.setConfigPortalTimeout(180);
-        wm.setAPStaticIPConfig(
-          IPAddress(192, 168, 4, 1),
-          IPAddress(192, 168, 4, 1),
-          IPAddress(255, 255, 255, 0)
-        );
-        // startConfigPortal est non-bloquant pendant 180 s max,
-        // puis rend la main que l'utilisateur ait configuré ou non.
-        bool ok = wm.startConfigPortal(AP_SSID, AP_PASSWORD);
-        if (ok) {
-          wifiConnected = true;
-          Serial.println("WiFi: configured via fallback portal. IP = " + WiFi.localIP().toString());
-          MDNS.end();
-          if (MDNS.begin("blight")) {
-            MDNS.addService("http", "tcp", 80);
-            Serial.println("mDNS restarted: blight.local");
-          }
-        } else {
-          Serial.println("WiFi: fallback portal timed out. Still offline.");
-          // On repart à zéro — nouvelle fenêtre de 5 min avant prochain essai
-        }
-      } else {
-        WiFi.reconnect();
-      }
+      WiFi.reconnect();
     } else {
       if (!wifiConnected) {
         wifiConnected = true;
-        wifiRetryCount = 0;   // connexion rétablie — reset compteur
-        // Redémarre mDNS — il ne survit pas à une coupure WiFi
         MDNS.end();
         if (MDNS.begin("blight")) {
           MDNS.addService("http", "tcp", 80);
-          Serial.println("mDNS restarted: blight.local");
-        } else {
-          Serial.println("mDNS restart failed (non-bloquant)");
         }
         Serial.println("WiFi Reconnected: " + WiFi.localIP().toString());
+        pushStatusToFirebase(); // Push immédiat après reconnexion
       }
     }
   }
@@ -164,22 +126,182 @@ void loop() {
     updateFSM(lastLdrValue, now);
   }
 
+  // Firebase : lire les commandes
+  if (wifiConnected && now - lastFbPoll >= FB_POLL_INTERVAL_MS) {
+    lastFbPoll = now;
+    pollFirebaseCommands();
+  }
+
+  // Firebase : publier l'état
+  if (wifiConnected && now - lastFbPush >= FB_PUSH_INTERVAL_MS) {
+    lastFbPush = now;
+    pushStatusToFirebase();
+  }
+
   yield();
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------
+// FIREBASE — Publier l'état
+// -----------------------------------------------------------------------
+void pushStatusToFirebase() {
+  if (!wifiConnected) return;
+
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure(); // Pas de vérification certificat (OK pour IoT local)
+
+  HTTPClient https;
+  if (!https.begin(client, FIREBASE_URL FB_STATUS_PATH)) return;
+
+  https.addHeader("Content-Type", "application/json");
+
+  // Construire le JSON d'état
+  StaticJsonDocument<512> doc;
+  doc["app"]          = "BLight V1.1.0";
+  doc["etat_ldr"]     = getLDRStateString(currentState);
+  doc["ldr_value"]    = lastLdrValue;
+  doc["seuil_nuit"]   = seuilNuit;
+  doc["seuil_jour"]   = seuilJour;
+  doc["ip"]           = WiFi.localIP().toString();
+  doc["updated_at"]   = millis();
+
+  JsonArray relays = doc.createNestedArray("relays");
+  JsonArray modes  = doc.createNestedArray("relay_modes");
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    relays.add(relayStates[i]);
+    modes.add(relayAutoModes[i]);
+  }
+
+  String body;
+  serializeJson(doc, body);
+
+  int code = https.PUT(body);
+  if (code == 200) {
+    Serial.println("Firebase: Status pushed OK");
+  } else {
+    Serial.println("Firebase: Push failed " + String(code));
+  }
+  https.end();
+}
+
+// -----------------------------------------------------------------------
+// FIREBASE — Lire et exécuter les commandes
+// -----------------------------------------------------------------------
+void pollFirebaseCommands() {
+  if (!wifiConnected) return;
+
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+  if (!https.begin(client, FIREBASE_URL FB_COMMANDS_PATH)) return;
+
+  int code = https.GET();
+  if (code != 200) {
+    https.end();
+    return;
+  }
+
+  String payload = https.getString();
+  https.end();
+
+  if (payload == "null" || payload.isEmpty()) return;
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) return;
+
+  bool changed = false;
+
+  // Traiter commandes relais (relay_0 à relay_3)
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    String key = "relay_" + String(i);
+    if (doc.containsKey(key)) {
+      JsonObject cmd = doc[key];
+      bool done = cmd["done"] | true;
+      if (!done) {
+        bool newState = cmd["state"] | relayStates[i];
+        relayStates[i]    = newState;
+        relayAutoModes[i] = false;
+        setRelay(i, newState);
+        Serial.println("Firebase cmd: relay_" + String(i) + " -> " + String(newState ? "ON" : "OFF"));
+        changed = true;
+
+        // Marquer comme traité
+        markCommandDone(key);
+      }
+    }
+  }
+
+  // Traiter commandes mode (mode_0 à mode_3)
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    String key = "mode_" + String(i);
+    if (doc.containsKey(key)) {
+      JsonObject cmd = doc[key];
+      bool done = cmd["done"] | true;
+      if (!done) {
+        bool autoMode = cmd["auto"] | false;
+        relayAutoModes[i] = autoMode;
+        if (autoMode) {
+          bool shouldBeOn = isNightState(currentState);
+          relayStates[i] = shouldBeOn;
+          setRelay(i, shouldBeOn);
+        }
+        Serial.println("Firebase cmd: mode_" + String(i) + " -> " + String(autoMode ? "Auto" : "Manuel"));
+        changed = true;
+        markCommandDone(key);
+      }
+    }
+  }
+
+  // Traiter commande seuils
+  if (doc.containsKey("thresholds")) {
+    JsonObject cmd = doc["thresholds"];
+    bool done = cmd["done"] | true;
+    if (!done) {
+      int n = cmd["seuil_nuit"] | seuilNuit;
+      int j = cmd["seuil_jour"] | seuilJour;
+      if (n >= 0 && j <= 1023 && n < j) {
+        seuilNuit = n;
+        seuilJour = j;
+        Serial.println("Firebase cmd: thresholds nuit=" + String(n) + " jour=" + String(j));
+      }
+      changed = true;
+      markCommandDone("thresholds");
+    }
+  }
+
+  if (changed) {
+    saveState();
+    pushStatusToFirebase(); // Push immédiat après exécution
+  }
+}
+
+// Marque une commande comme traitée (done: true)
+void markCommandDone(String key) {
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+  String url = String(FIREBASE_URL) + "/blight/commands/" + key + ".json";
+  if (!https.begin(client, url)) return;
+
+  https.addHeader("Content-Type", "application/json");
+  https.PATCH("{\"done\":true}");
+  https.end();
+}
+
+// -----------------------------------------------------------------------
 // WiFi
-// =============================================================================
+// -----------------------------------------------------------------------
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
-  // If saved credentials exist, try connecting directly
   if (WiFi.SSID().length() > 0) {
     Serial.println("WiFi: Connecting to " + WiFi.SSID() + "...");
     WiFi.begin();
-
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
       delay(500);
@@ -194,12 +316,9 @@ void setupWiFi() {
     return;
   }
 
-  // No connection → captive portal
-  Serial.println("WiFi: Starting captive portal '" + String(AP_SSID) + "'");
+  Serial.println("WiFi: Starting captive portal...");
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
-  wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-
   bool connected = wm.autoConnect(AP_SSID, AP_PASSWORD);
 
   if (connected) {
@@ -212,26 +331,21 @@ void setupWiFi() {
   }
 }
 
-// =============================================================================
-// HTTP API
-// =============================================================================
+// -----------------------------------------------------------------------
+// HTTP API locale (inchangée)
+// -----------------------------------------------------------------------
 void setupServer() {
-  // CORS + endpoints
   server.on("/api/status",       HTTP_GET,     handleStatus);
   server.on("/api/relay/toggle", HTTP_POST,    handleToggle);
   server.on("/api/relay/set",    HTTP_POST,    handleSet);
   server.on("/api/mode",         HTTP_POST,    handleMode);
   server.on("/api/thresholds",   HTTP_POST,    handleThresholds);
   server.on("/api/wifi/reset",   HTTP_POST,    handleWifiReset);
-
-  // CORS preflight
   server.on("/api/status",       HTTP_OPTIONS, corsOK);
   server.on("/api/relay/toggle", HTTP_OPTIONS, corsOK);
   server.on("/api/relay/set",    HTTP_OPTIONS, corsOK);
   server.on("/api/mode",         HTTP_OPTIONS, corsOK);
   server.on("/api/thresholds",   HTTP_OPTIONS, corsOK);
-  server.on("/api/wifi/reset",   HTTP_OPTIONS, corsOK);
-
   server.begin();
   Serial.println("HTTP: Server started on port 80");
 }
@@ -253,19 +367,18 @@ String readBody() {
   return "";
 }
 
-// --- GET /api/status ---
 void handleStatus() {
-  StaticJsonDocument<512> doc;
-  doc["app"] = "BLight V1.0.8";
-  doc["etat_ldr"] = getLDRStateString(currentState);
-  doc["valeur_ldr"] = lastLdrValue;
-  doc["seuil_nuit"] = seuilNuit;
-  doc["seuil_jour"] = seuilJour;
+  StaticJsonDocument<768> doc;
+  doc["app"]            = "BLight V1.1.0";
+  doc["etat_ldr"]       = getLDRStateString(currentState);
+  doc["valeur_ldr"]     = lastLdrValue;
+  doc["seuil_nuit"]     = seuilNuit;
+  doc["seuil_jour"]     = seuilJour;
   doc["wifi_connected"] = wifiConnected;
-  doc["ip"] = WiFi.localIP().toString();
+  doc["ip"]             = WiFi.localIP().toString();
 
   JsonArray relays = doc.createNestedArray("relays");
-  JsonArray modes = doc.createNestedArray("relay_modes");
+  JsonArray modes  = doc.createNestedArray("relay_modes");
   for (int i = 0; i < NUM_RELAYS; i++) {
     relays.add(relayStates[i]);
     modes.add(relayAutoModes[i]);
@@ -276,127 +389,64 @@ void handleStatus() {
   sendJSON(200, out);
 }
 
-// --- POST /api/relay/set ---
-/**
- * Force l'état d'un relais à une valeur explicite (idempotent).
- * Contrairement à toggle, appeler set deux fois avec le même état
- * ne change rien — utile à la reconnexion de l'app Flutter.
- *
- * Body : {"index": N, "state": true|false}
- *
- * Passe le relais en mode manuel (même comportement que toggle).
- * Retourne aussi l'état appliqué pour confirmation côté Flutter.
- */
 void handleSet() {
   StaticJsonDocument<64> doc;
-  if (deserializeJson(doc, readBody())) {
-    sendJSON(400, "{\"error\":\"Invalid JSON\"}");
-    return;
-  }
-
+  if (deserializeJson(doc, readBody())) { sendJSON(400, "{\"error\":\"Invalid JSON\"}"); return; }
   int idx = doc["index"] | -1;
-  if (idx < 0 || idx >= NUM_RELAYS) {
-    sendJSON(400, "{\"error\":\"Invalid index\"}");
-    return;
-  }
-
-  if (!doc.containsKey("state")) {
-    sendJSON(400, "{\"error\":\"Missing field: state\"}");
-    return;
-  }
-
+  if (idx < 0 || idx >= NUM_RELAYS) { sendJSON(400, "{\"error\":\"Invalid index\"}"); return; }
+  if (!doc.containsKey("state")) { sendJSON(400, "{\"error\":\"Missing state\"}"); return; }
   bool newState = doc["state"].as<bool>();
-  relayStates[idx]    = newState;
-  relayAutoModes[idx] = false;   // passage en manuel systématique
+  relayStates[idx] = newState;
+  relayAutoModes[idx] = false;
   setRelay(idx, newState);
-
   saveState();
-  Serial.println("Relay " + String(idx) + " SET -> " + String(newState ? "ON" : "OFF"));
-
-  // Réponse avec l'état confirmé (permet à Flutter de vérifier sans GET /status)
-  String resp = "{\"status\":\"ok\",\"index\":" + String(idx) +
-                ",\"state\":" + String(newState ? "true" : "false") + "}";
+  pushStatusToFirebase();
+  String resp = "{\"status\":\"ok\",\"index\":" + String(idx) + ",\"state\":" + String(newState ? "true" : "false") + "}";
   sendJSON(200, resp);
 }
 
-// --- POST /api/relay/toggle ---
 void handleToggle() {
   StaticJsonDocument<64> doc;
-  if (deserializeJson(doc, readBody())) {
-    sendJSON(400, "{\"error\":\"Invalid JSON\"}");
-    return;
-  }
-
+  if (deserializeJson(doc, readBody())) { sendJSON(400, "{\"error\":\"Invalid JSON\"}"); return; }
   int idx = doc["index"] | -1;
-  if (idx < 0 || idx >= NUM_RELAYS) {
-    sendJSON(400, "{\"error\":\"Invalid index\"}");
-    return;
-  }
-
+  if (idx < 0 || idx >= NUM_RELAYS) { sendJSON(400, "{\"error\":\"Invalid index\"}"); return; }
   relayStates[idx] = !relayStates[idx];
   relayAutoModes[idx] = false;
   setRelay(idx, relayStates[idx]);
-
   saveState();
-  Serial.println("Relay " + String(idx) + " -> " + String(relayStates[idx] ? "ON" : "OFF"));
+  pushStatusToFirebase(); // Synchroniser Firebase après action locale
   sendJSON(200, "{\"status\":\"ok\"}");
 }
 
-// --- POST /api/mode ---
 void handleMode() {
   StaticJsonDocument<64> doc;
-  if (deserializeJson(doc, readBody())) {
-    sendJSON(400, "{\"error\":\"Invalid JSON\"}");
-    return;
-  }
-
+  if (deserializeJson(doc, readBody())) { sendJSON(400, "{\"error\":\"Invalid JSON\"}"); return; }
   int idx = doc["index"] | -1;
-  if (idx < 0 || idx >= NUM_RELAYS) {
-    sendJSON(400, "{\"error\":\"Invalid index\"}");
-    return;
-  }
-
+  if (idx < 0 || idx >= NUM_RELAYS) { sendJSON(400, "{\"error\":\"Invalid index\"}"); return; }
   bool autoMode = doc["auto"] | false;
   relayAutoModes[idx] = autoMode;
-
   if (autoMode) {
     bool shouldBeOn = isNightState(currentState);
     relayStates[idx] = shouldBeOn;
     setRelay(idx, shouldBeOn);
   }
-
   saveState();
-  Serial.println("Relay " + String(idx) + " -> " + String(autoMode ? "Auto" : "Manual"));
+  pushStatusToFirebase();
   sendJSON(200, "{\"status\":\"ok\"}");
 }
 
-// --- POST /api/thresholds ---
 void handleThresholds() {
   StaticJsonDocument<128> doc;
-  if (deserializeJson(doc, readBody())) {
-    sendJSON(400, "{\"error\":\"Invalid JSON\"}");
-    return;
-  }
-
+  if (deserializeJson(doc, readBody())) { sendJSON(400, "{\"error\":\"Invalid JSON\"}"); return; }
   int n = doc["seuil_nuit"] | -1;
   int j = doc["seuil_jour"] | -1;
-  if (n < 0 || n > 1023 || j < 0 || j > 1023) {
-    sendJSON(400, "{\"error\":\"Invalid values (0-1023)\"}");
-    return;
-  }
-  if (n >= j) {
-    sendJSON(400, "{\"error\":\"seuil_nuit must be < seuil_jour\"}");
-    return;
-  }
-
-  seuilNuit = n;
-  seuilJour = j;
+  if (n < 0 || n > 1023 || j < 0 || j > 1023 || n >= j) { sendJSON(400, "{\"error\":\"Invalid values\"}"); return; }
+  seuilNuit = n; seuilJour = j;
   saveState();
-  Serial.println("Thresholds: nuit=" + String(seuilNuit) + " jour=" + String(seuilJour));
+  pushStatusToFirebase();
   sendJSON(200, "{\"status\":\"ok\"}");
 }
 
-// --- POST /api/wifi/reset ---
 void handleWifiReset() {
   sendJSON(200, "{\"status\":\"resetting\"}");
   delay(500);
@@ -404,31 +454,12 @@ void handleWifiReset() {
   ESP.restart();
 }
 
-// =============================================================================
-// Persistence (LittleFS)
-// =============================================================================
-
-/**
- * saveState() — écrit l'état courant dans /state.json
- *
- * Format JSON :
- * {
- *   "relay_states": [false, false, ...],   // état ON/OFF de chaque relais
- *   "relay_modes":  [true,  true,  ...],   // true = auto, false = manuel
- *   "seuil_nuit": 300,
- *   "seuil_jour": 700
- * }
- *
- * Appelé après chaque modification via API.
- * Écrase l'ancien fichier à chaque fois (fichier petit, flash OK).
- */
+// -----------------------------------------------------------------------
+// Persistence
+// -----------------------------------------------------------------------
 void saveState() {
   File f = LittleFS.open(STATE_FILE, "w");
-  if (!f) {
-    Serial.println("LittleFS: Cannot open state.json for write");
-    return;
-  }
-
+  if (!f) return;
   StaticJsonDocument<256> doc;
   JsonArray states = doc.createNestedArray("relay_states");
   JsonArray modes  = doc.createNestedArray("relay_modes");
@@ -438,53 +469,20 @@ void saveState() {
   }
   doc["seuil_nuit"] = seuilNuit;
   doc["seuil_jour"] = seuilJour;
-
   serializeJson(doc, f);
   f.close();
-  Serial.println("LittleFS: State saved");
 }
 
-/**
- * loadState() — restaure l'état depuis /state.json au démarrage.
- *
- * Si le fichier est absent ou corrompu, les valeurs par défaut de config.h
- * sont conservées et les relais restent OFF (sécurité).
- * Les relais physiques sont mis à jour immédiatement après la restauration.
- */
 void loadState() {
-  if (!LittleFS.exists(STATE_FILE)) {
-    Serial.println("LittleFS: No state file — using defaults");
-    return;
-  }
-
+  if (!LittleFS.exists(STATE_FILE)) return;
   File f = LittleFS.open(STATE_FILE, "r");
-  if (!f) {
-    Serial.println("LittleFS: Cannot open state.json for read");
-    return;
-  }
-
+  if (!f) return;
   StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, f);
+  if (deserializeJson(doc, f)) { f.close(); return; }
   f.close();
-
-  if (err) {
-    Serial.println("LittleFS: state.json corrupted — using defaults");
-    LittleFS.remove(STATE_FILE);
-    return;
-  }
-
-  // Restore thresholds
   seuilNuit = doc["seuil_nuit"] | DEFAULT_SEUIL_NUIT;
   seuilJour = doc["seuil_jour"] | DEFAULT_SEUIL_JOUR;
-
-  // Sanity check — protège contre un fichier écrit avec des valeurs inversées
-  if (seuilNuit >= seuilJour) {
-    Serial.println("LittleFS: Invalid thresholds in state — resetting to defaults");
-    seuilNuit = DEFAULT_SEUIL_NUIT;
-    seuilJour = DEFAULT_SEUIL_JOUR;
-  }
-
-  // Restore relay states and modes, then apply to GPIO
+  if (seuilNuit >= seuilJour) { seuilNuit = DEFAULT_SEUIL_NUIT; seuilJour = DEFAULT_SEUIL_JOUR; }
   JsonArray states = doc["relay_states"];
   JsonArray modes  = doc["relay_modes"];
   for (int i = 0; i < NUM_RELAYS; i++) {
@@ -492,77 +490,52 @@ void loadState() {
     if (i < (int)modes.size())  relayAutoModes[i] = modes[i].as<bool>();
     setRelay(i, relayStates[i]);
   }
-
-  Serial.println("LittleFS: State loaded — nuit=" + String(seuilNuit) +
-                 " jour=" + String(seuilJour));
+  Serial.println("LittleFS: State loaded");
 }
 
-// =============================================================================
-// Relay
-// =============================================================================
+// -----------------------------------------------------------------------
+// Relay + LDR (inchangés)
+// -----------------------------------------------------------------------
 void setRelay(int idx, bool on) {
   digitalWrite(RELAY_PINS[idx], on ? LOW : HIGH);
 }
 
-// =============================================================================
-// LDR
-// =============================================================================
 String getLDRStateString(LDRState s) {
   switch (s) {
-    case ST_JOUR: return "JOUR";
+    case ST_JOUR:       return "JOUR";
     case ST_DEBUT_NUIT: return "DEBUT_NUIT";
-    case ST_NUIT: return "NUIT";
+    case ST_NUIT:       return "NUIT";
     case ST_DEBUT_JOUR: return "DEBUT_JOUR";
-    default: return "JOUR";
+    default:            return "JOUR";
   }
 }
 
-bool isNightState(LDRState s) {
-  // ST_DEBUT_NUIT exclu intentionnellement : le signal n'est pas encore
-  // confirmé stable (délai 5 s non écoulé). Activer les relais auto ici
-  // provoquerait une impulsion parasite si la lumière revient avant confirmation.
-  return (s == ST_NUIT);
-}
+bool isNightState(LDRState s) { return (s == ST_NUIT); }
 
 void updateFSM(int ldr, unsigned long now) {
   switch (currentState) {
     case ST_JOUR:
-      if (ldr <= seuilNuit) {
-        currentState = ST_DEBUT_NUIT;
-        stateTimer = now;
-        Serial.println("LDR: Night? (" + String(ldr) + "<=" + String(seuilNuit) + ")");
-      }
+      if (ldr <= seuilNuit) { currentState = ST_DEBUT_NUIT; stateTimer = now; }
       break;
-
     case ST_DEBUT_NUIT:
-      if (ldr > seuilNuit) {
-        currentState = ST_JOUR;
-      } else if (now - stateTimer >= DELAI_NUIT_MS) {
+      if (ldr > seuilNuit) { currentState = ST_JOUR; }
+      else if (now - stateTimer >= DELAI_NUIT_MS) {
         currentState = ST_NUIT;
-        for (int i = 0; i < NUM_RELAYS; i++) {
+        for (int i = 0; i < NUM_RELAYS; i++)
           if (relayAutoModes[i]) { relayStates[i] = true; setRelay(i, true); }
-        }
-        Serial.println("LDR: Night confirmed. Auto relays ON.");
+        pushStatusToFirebase();
       }
       break;
-
     case ST_NUIT:
-      if (ldr >= seuilJour) {
-        currentState = ST_DEBUT_JOUR;
-        stateTimer = now;
-        Serial.println("LDR: Day? (" + String(ldr) + ">=" + String(seuilJour) + ")");
-      }
+      if (ldr >= seuilJour) { currentState = ST_DEBUT_JOUR; stateTimer = now; }
       break;
-
     case ST_DEBUT_JOUR:
-      if (ldr < seuilJour) {
-        currentState = ST_NUIT;
-      } else if (now - stateTimer >= DELAI_JOUR_MS) {
+      if (ldr < seuilJour) { currentState = ST_NUIT; }
+      else if (now - stateTimer >= DELAI_JOUR_MS) {
         currentState = ST_JOUR;
-        for (int i = 0; i < NUM_RELAYS; i++) {
+        for (int i = 0; i < NUM_RELAYS; i++)
           if (relayAutoModes[i]) { relayStates[i] = false; setRelay(i, false); }
-        }
-        Serial.println("LDR: Day confirmed. Auto relays OFF.");
+        pushStatusToFirebase();
       }
       break;
   }

@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "890599450984",
+    "project_id": "blight-28253",
+    "storage_bucket": "blight-28253.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:890599450984:android:bf0baa467aee630cd98edd",
+        "android_client_info": {
+          "package_name": "com.example.mobil_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyALxQqNNATuAn3pVnitjgEo8Sn6PlxrEi8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:890599450984:android:cec438ed8999d3fed98edd",
+        "android_client_info": {
+          "package_name": "com.example.mobileapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyALxQqNNATuAn3pVnitjgEo8Sn6PlxrEi8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
