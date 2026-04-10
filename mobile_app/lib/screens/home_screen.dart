@@ -21,10 +21,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String _espIp = '';
   Timer? _refreshTimer;
   Timer? _heartbeatTimer;
-  Timer? _debounceTimer;
   SharedPreferences? _prefs;
   bool _isConnected = false;
   bool _isSearching = true;
+
+  // Relais en attente de confirmation — le refresh ne les écrase pas
+  final Set<int> _pendingRelays = {};
 
   final List<String> _relayLabels = [
     'Salon',
@@ -76,8 +78,14 @@ class _HomeScreenState extends State<HomeScreen> {
     _heartbeatTimer?.cancel();
     _heartbeatTimer =
         Timer.periodic(const Duration(seconds: 10), (_) async {
-      final connected = await _espService.heartbeat();
-      if (mounted) setState(() => _isConnected = connected);
+      final previousMode = _espService.mode;
+      final connected    = await _espService.heartbeat();
+      if (!mounted) return;
+      setState(() => _isConnected = connected);
+      // Mode changé local <-> Firebase : adapter l'intervalle de refresh
+      if (_espService.mode != previousMode) {
+        _startAutoRefresh();
+      }
     });
   }
 
@@ -91,53 +99,83 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _refreshData() async {
-    if (_debounceTimer?.isActive == true) return;
     final newState = await _espService.fetchStatus();
-    if (mounted) {
-      setState(() {
-        if (newState != null) {
-          _state = newState;
-          _isConnected = true;
-        } else {
-          _state = _state.copyWith(wifiConnected: false);
+    if (!mounted || newState == null) return;
+
+    setState(() {
+      _isConnected = true;
+      // Ne pas écraser les relais en attente de confirmation
+      if (_pendingRelays.isEmpty) {
+        _state = newState;
+      } else {
+        final mergedRelays = List<bool>.from(newState.relayStates);
+        final mergedModes  = List<bool>.from(newState.relayAutoModes);
+        for (final i in _pendingRelays) {
+          if (i < mergedRelays.length) {
+            mergedRelays[i] = _state.relayStates[i];
+            mergedModes[i]  = _state.relayAutoModes[i];
+          }
         }
-      });
-    }
+        _state = newState.copyWith(
+          relayStates:    mergedRelays,
+          relayAutoModes: mergedModes,
+        );
+      }
+    });
   }
 
   @override
   void dispose() {
     _refreshTimer?.cancel();
     _heartbeatTimer?.cancel();
-    _debounceTimer?.cancel();
     super.dispose();
   }
 
+  // ============================================================
+  // TOGGLE — optimistic update sans clignotement
+  // ============================================================
   Future<void> _toggleRelay(int index) async {
     final previousState = _state.relayStates.length > index
         ? _state.relayStates[index]
         : false;
-    final newStates = List<bool>.from(_state.relayStates);
-    newStates[index] = !previousState;
+
+    // Mise à jour immédiate de l'UI
+    final newStates    = List<bool>.from(_state.relayStates);
     final newAutoModes = List<bool>.from(_state.relayAutoModes);
+    newStates[index]    = !previousState;
     newAutoModes[index] = false;
 
     setState(() {
+      _pendingRelays.add(index);
       _state = _state.copyWith(
-          relayStates: newStates, relayAutoModes: newAutoModes);
+        relayStates:    newStates,
+        relayAutoModes: newAutoModes,
+      );
     });
 
-    _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(seconds: 3), () {});
+    // Envoyer la commande
+    final success =
+        await _espService.toggleRelayWithState(index, previousState);
 
-    final success = await _espService.toggleRelayWithState(index, previousState);
-    if (!success && mounted) {
+    if (!mounted) return;
+
+    if (success) {
+      // Libérer le verrou après que l'ESP a eu le temps d'exécuter
+      Future.delayed(
+        _espService.isFirebase
+            ? const Duration(seconds: 5)
+            : const Duration(seconds: 2),
+        () {
+          if (mounted) setState(() => _pendingRelays.remove(index));
+        },
+      );
+    } else {
+      // Echec — rollback immédiat
       setState(() {
         final rollback = List<bool>.from(_state.relayStates);
         rollback[index] = previousState;
-        newAutoModes[index] = true;
-        _state = _state.copyWith(
-            relayStates: rollback, relayAutoModes: newAutoModes);
+        _state = _state.copyWith(relayStates: rollback);
+        _pendingRelays.remove(index);
       });
     }
   }
@@ -245,12 +283,11 @@ class _HomeScreenState extends State<HomeScreen> {
   // ============================================================
   // BUILD
   // ============================================================
-
   @override
   Widget build(BuildContext context) {
-    final isOffline = !_isConnected;
-    final isAnyAuto = _state.relayAutoModes.contains(true);
-    final isFirebaseMode = _espService.isFirebase;
+    final isOffline  = !_isConnected;
+    final isAnyAuto  = _state.relayAutoModes.contains(true);
+    final isFirebase = _espService.isFirebase;
 
     return Scaffold(
       backgroundColor: AppTheme.backgroundDark,
@@ -283,15 +320,14 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
         actions: [
-          // Badge mode connexion
           if (!_isSearching)
             Padding(
               padding: const EdgeInsets.only(right: 4),
-              child: _buildConnectionBadge(isFirebaseMode, isOffline),
+              child: _buildConnectionBadge(isFirebase, isOffline),
             ),
-          // Paramètres
           IconButton(
-            icon: const Icon(Icons.settings, color: AppTheme.textSecondary),
+            icon: const Icon(Icons.settings,
+                color: AppTheme.textSecondary),
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(
@@ -307,10 +343,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Column(
         children: [
-          // Banner Firebase mode
-          if (isFirebaseMode && _isConnected)
-            _buildFirebaseBanner(),
-
           Expanded(
             child: RefreshIndicator(
               onRefresh: _refreshData,
@@ -343,8 +375,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             TextButton.icon(
-                              icon:
-                                  const Icon(Icons.auto_awesome, size: 18),
+                              icon: const Icon(Icons.auto_awesome,
+                                  size: 18),
                               label: const Text('Tout Auto'),
                               onPressed: isOffline
                                   ? null
@@ -354,7 +386,8 @@ class _HomeScreenState extends State<HomeScreen> {
                             ),
                             const SizedBox(width: 8),
                             TextButton.icon(
-                              icon: const Icon(Icons.back_hand, size: 18),
+                              icon:
+                                  const Icon(Icons.back_hand, size: 18),
                               label: const Text('Tout Manuel'),
                               onPressed: isOffline
                                   ? null
@@ -372,7 +405,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
 
-          // Grille relais (bas fixe)
+          // Relais
           Container(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             child: Column(
@@ -411,16 +444,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     );
                   },
                 ),
-                const SizedBox(height: 8),
-                Center(
-                  child: Text(
-                    isFirebaseMode
-                        ? '🌐 Contrôle via Internet (Firebase)'
-                        : 'ESP IP: $_espIp',
-                    style: const TextStyle(
-                        color: AppTheme.textSecondary, fontSize: 12),
-                  ),
-                ),
               ],
             ),
           ),
@@ -429,10 +452,14 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // ============================================================
+  // Badge connexion
+  // ============================================================
   Widget _buildConnectionBadge(bool isFirebase, bool isOffline) {
     if (isOffline) {
       return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         decoration: BoxDecoration(
           color: Colors.red.withOpacity(0.2),
           borderRadius: BorderRadius.circular(8),
@@ -449,14 +476,15 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
     }
-
     if (isFirebase) {
       return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         decoration: BoxDecoration(
           color: Colors.orange.withOpacity(0.2),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: Colors.orange.withOpacity(0.5)),
+          border:
+              Border.all(color: Colors.orange.withOpacity(0.5)),
         ),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
@@ -464,14 +492,15 @@ class _HomeScreenState extends State<HomeScreen> {
             Icon(Icons.cloud, color: Colors.orange, size: 14),
             SizedBox(width: 4),
             Text('Internet',
-                style: TextStyle(color: Colors.orange, fontSize: 11)),
+                style:
+                    TextStyle(color: Colors.orange, fontSize: 11)),
           ],
         ),
       );
     }
-
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding:
+          const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
         color: Colors.green.withOpacity(0.2),
         borderRadius: BorderRadius.circular(8),
@@ -484,26 +513,6 @@ class _HomeScreenState extends State<HomeScreen> {
           SizedBox(width: 4),
           Text('Local',
               style: TextStyle(color: Colors.green, fontSize: 11)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFirebaseBanner() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: Colors.orange.withOpacity(0.15),
-      child: const Row(
-        children: [
-          Icon(Icons.cloud_queue, color: Colors.orange, size: 16),
-          SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              'Mode Internet — commandes envoyées via Firebase, l\'ESP les applique automatiquement.',
-              style: TextStyle(color: Colors.orange, fontSize: 12),
-            ),
-          ),
         ],
       ),
     );

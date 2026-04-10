@@ -1,7 +1,7 @@
 #pragma once
 
 #define AP_SSID      "SmartLight_AP"
-#define AP_PASSWORD  "smartlight123"
+#define AP_PASSWORD  "12345678"
 
 #define STA_SSID     ""
 #define STA_PASSWORD ""
